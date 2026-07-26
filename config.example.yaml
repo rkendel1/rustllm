@@ -1,0 +1,50 @@
+listener:
+  bind: "0.0.0.0:3000"
+
+auth:
+  virtual_keys:
+    - "dev-local-key"
+
+limits:
+  global_per_minute: 5000
+  per_key_per_minute: 500
+  retries: 2
+  connect_timeout_ms: 2500
+  total_timeout_ms: 60000
+
+providers:
+  openai:
+    kind: open_ai_compat
+    base_url: "https://api.openai.com"
+    api_key_env: "OPENAI_API_KEY"
+  anthropic:
+    kind: anthropic
+    base_url: "https://api.anthropic.com"
+    api_key_env: "ANTHROPIC_API_KEY"
+  local:
+    kind: open_ai_compat
+    base_url: "http://127.0.0.1:11434"
+
+model_aliases:
+  gpt-4o:
+    - provider: openai
+      model: gpt-4o
+    - provider: local
+      model: llama3.1:8b
+  claude-sonnet:
+    - provider: anthropic
+      model: claude-3-5-sonnet-20240620
+    - provider: openai
+      model: gpt-4o-mini
+
+plugins: []
+# plugins:
+#   - name: keyword_guardrail
+#     path: ./plugins/keyword_guardrail.wasm
+#     config:
+#       blocked:
+#         - "password"
+#         - "credit card"
+
+observability:
+  log_level: "info"
