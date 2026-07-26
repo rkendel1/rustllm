@@ -1,6 +1,6 @@
 # aether (rustllm)
 
-A high-performance, single-binary LLM/AI gateway written in Rust with Wasm plugin hooks.
+A high-performance, single-binary AI gateway kernel with a capability runtime.
 
 ## MVP features
 
@@ -15,7 +15,8 @@ A high-performance, single-binary LLM/AI gateway written in Rust with Wasm plugi
 - Prometheus metrics (`/metrics`)
 - Request ID propagation (`x-request-id`)
 - Token + estimated cost counters
-- Wasm plugin hooks: `on_auth`, `on_request`, `on_response`, `on_stream_chunk`
+- Capability runtime pipeline (identity, policy, routing, budget, guardrails, tools, providers, wasm)
+- Wasm capabilities via the same runtime contract as native capabilities
 
 ## Run
 
@@ -39,6 +40,14 @@ Each plugin must export:
 - hook signature: `(ptr: i32, len: i32) -> i64` where return packs output pointer/len as `(ptr << 32) | len`
 
 Input and output payloads are JSON. See `plugins/keyword_guardrail` for a working reference.
+
+## Capability runtime
+
+Requests and responses flow through the configurable capability pipeline:
+
+`identity -> policy -> budget_guard -> pii_filter -> semantic_router -> tool_mcp -> provider_router -> wasm`
+
+Each capability implements a shared contract (`on_request`, `on_response`) and receives a standard runtime context containing identity, metadata, budget, and policy state.
 
 ## Build example plugin
 

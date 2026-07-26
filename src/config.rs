@@ -16,6 +16,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
     #[serde(default)]
+    pub capabilities: CapabilityConfig,
+    #[serde(default)]
+    pub policies: Vec<PolicyRule>,
+    #[serde(default)]
     pub observability: ObservabilityConfig,
 }
 
@@ -121,6 +125,50 @@ pub struct PluginConfig {
     pub path: String,
     #[serde(default)]
     pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityConfig {
+    #[serde(default = "default_capability_pipeline")]
+    pub pipeline: Vec<String>,
+}
+
+impl Default for CapabilityConfig {
+    fn default() -> Self {
+        Self {
+            pipeline: default_capability_pipeline(),
+        }
+    }
+}
+
+fn default_capability_pipeline() -> Vec<String> {
+    vec![
+        "identity".to_string(),
+        "policy".to_string(),
+        "budget_guard".to_string(),
+        "pii_filter".to_string(),
+        "semantic_router".to_string(),
+        "tool_mcp".to_string(),
+        "provider_router".to_string(),
+        "wasm".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyRule {
+    pub name: String,
+    #[serde(default)]
+    pub when: HashMap<String, String>,
+    #[serde(default)]
+    pub deny: PolicyDeny,
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyDeny {
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

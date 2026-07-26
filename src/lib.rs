@@ -1,10 +1,13 @@
 pub mod auth;
+pub mod capabilities;
 pub mod config;
+pub mod kernel;
 pub mod metrics;
 pub mod models;
 pub mod plugins;
 pub mod providers;
 pub mod rate_limit;
+pub mod wasm;
 
 use std::{sync::Arc, time::Instant};
 
@@ -17,27 +20,34 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bytes::Bytes;
-use futures::StreamExt;
 use serde_json::json;
 use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    auth::{extract_bearer, is_authorized},
+    capabilities::{
+        auth::IdentityCapability, budget::BudgetCapability, guardrails::GuardrailCapability,
+        policy::PolicyCapability, providers::ProviderRoutingCapability, routing::RoutingCapability,
+        tools::ToolMcpCapability,
+    },
     config::AppConfig,
+    kernel::{
+        capability::CapabilityResult,
+        context::{Identity, Metadata, RequestContext, ResponseContext},
+        runtime::CapabilityRuntime,
+    },
     metrics::Metrics,
     models::{ChatCompletionRequest, openai_error},
-    plugins::{Hook, PluginManager},
     providers::{ProviderRegistry, ProviderResult},
     rate_limit::RateLimiter,
+    wasm::loader::WasmCapability,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub providers: Arc<ProviderRegistry>,
-    pub plugins: Arc<PluginManager>,
+    pub runtime: Arc<CapabilityRuntime>,
     pub limiter: Arc<RateLimiter>,
     pub metrics: Arc<Metrics>,
 }
@@ -82,79 +92,61 @@ async fn chat_completions(
         .map(ToString::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let auth_hook_input = json!({
-        "headers": headers_to_map(&headers),
-        "request_id": request_id,
-    });
-    if let Err(err) = state.plugins.execute(Hook::OnAuth, &auth_hook_input) {
-        state.metrics.plugin_errors_total.inc();
-        error!(error = %err, "auth plugin error");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "plugin auth failure",
-            "plugin_error",
-        );
+    let mut request_ctx = RequestContext {
+        request_id: request_id.clone(),
+        identity: Identity {
+            api_key: None,
+            authenticated: false,
+            plan: "free".to_string(),
+        },
+        model: request.clone(),
+        metadata: Metadata::default(),
+        budget: Default::default(),
+        policy: Default::default(),
+        headers: headers_to_map(&headers),
+    };
+
+    match state.runtime.on_request(&mut request_ctx).await {
+        Ok((CapabilityResult::Continue, _events)) => {
+            request = request_ctx.model.clone();
+        }
+        Ok((
+            CapabilityResult::Deny {
+                message,
+                kind,
+                status_code,
+            },
+            _events,
+        )) => {
+            state
+                .metrics
+                .requests_total
+                .with_label_values(&[&status_code.to_string()])
+                .inc();
+            return error_response(
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                &message,
+                &kind,
+            );
+        }
+        Err(err) => {
+            state.metrics.plugin_errors_total.inc();
+            error!(error = %err, "capability runtime request failure");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "capability runtime request failure",
+                "capability_error",
+            );
+        }
     }
 
-    if !is_authorized(&headers, &state.config.auth) {
-        state
-            .metrics
-            .requests_total
-            .with_label_values(&["401"])
-            .inc();
-        return error_response(StatusCode::UNAUTHORIZED, "unauthorized", "invalid_api_key");
-    }
-
-    let caller_key = extract_bearer(&headers);
-    if !state.limiter.check(caller_key.as_deref()) {
+    if !state.limiter.check(request_ctx.identity.api_key.as_deref()) {
         state
             .metrics
             .requests_total
             .with_label_values(&["429"])
             .inc();
         return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited", "rate_limit");
-    }
-
-    let req_hook_input = serde_json::to_value(&request).unwrap_or_default();
-    match state.plugins.execute(Hook::OnRequest, &req_hook_input) {
-        Ok(result) if !result.allow => {
-            state
-                .metrics
-                .requests_total
-                .with_label_values(&["403"])
-                .inc();
-            return error_response(
-                StatusCode::FORBIDDEN,
-                result
-                    .reject_reason
-                    .as_deref()
-                    .unwrap_or("request rejected by plugin"),
-                "plugin_reject",
-            );
-        }
-        Ok(result) => {
-            if let Some(modified) = result.body {
-                match serde_json::from_value::<ChatCompletionRequest>(modified) {
-                    Ok(new_req) => request = new_req,
-                    Err(err) => {
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            &format!("plugin produced invalid request: {}", err),
-                            "invalid_request_error",
-                        );
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            state.metrics.plugin_errors_total.inc();
-            error!(error = %err, "on_request plugin error");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "plugin request failure",
-                "plugin_error",
-            );
-        }
     }
 
     let provider_result = match state.providers.execute(&request, &headers).await {
@@ -185,34 +177,44 @@ async fn chat_completions(
 
     match provider_result {
         ProviderResult::Json(mut body, provider_model) => {
-            match state.plugins.execute(Hook::OnResponse, &body) {
-                Ok(result) if !result.allow => {
+            let mut response_ctx = ResponseContext {
+                request_id: request_id.clone(),
+                identity: request_ctx.identity.clone(),
+                metadata: request_ctx.metadata.clone(),
+                policy: request_ctx.policy.clone(),
+                provider_model: Some(provider_model.clone()),
+                body: body.clone(),
+            };
+            match state.runtime.on_response(&mut response_ctx).await {
+                Ok((CapabilityResult::Continue, _events)) => {
+                    body = response_ctx.body;
+                }
+                Ok((
+                    CapabilityResult::Deny {
+                        message,
+                        kind,
+                        status_code,
+                    },
+                    _events,
+                )) => {
                     state
                         .metrics
                         .requests_total
-                        .with_label_values(&["403"])
+                        .with_label_values(&[&status_code.to_string()])
                         .inc();
                     return error_response(
-                        StatusCode::FORBIDDEN,
-                        result
-                            .reject_reason
-                            .as_deref()
-                            .unwrap_or("response rejected by plugin"),
-                        "plugin_reject",
+                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                        &message,
+                        &kind,
                     );
-                }
-                Ok(result) => {
-                    if let Some(modified) = result.body {
-                        body = modified;
-                    }
                 }
                 Err(err) => {
                     state.metrics.plugin_errors_total.inc();
-                    error!(error = %err, "on_response plugin error");
+                    error!(error = %err, "capability runtime response failure");
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "plugin response failure",
-                        "plugin_error",
+                        "capability runtime response failure",
+                        "capability_error",
                     );
                 }
             }
@@ -255,31 +257,10 @@ async fn chat_completions(
                 .with_label_values(&["200"])
                 .inc();
 
-            let plugins = state.plugins.clone();
-            let transformed = stream.map(move |chunk| {
-                chunk.and_then(|bytes| {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    let payload = json!({"chunk": text});
-                    let hooked = plugins.execute(Hook::OnStreamChunk, &payload)?;
-                    if !hooked.allow {
-                        return Ok(Bytes::from_static(b"event: error\ndata: [DONE]\n\n"));
-                    }
-                    let out = hooked
-                        .body
-                        .and_then(|b| {
-                            b.get("chunk")
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string)
-                        })
-                        .unwrap_or(text);
-                    Ok(Bytes::from(out))
-                })
-            });
-
             let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
-                .body(Body::from_stream(transformed))
+                .body(Body::from_stream(stream))
                 .expect("valid stream response");
             response.headers_mut().insert(
                 "x-request-id",
@@ -306,14 +287,36 @@ fn estimate_cost(model: &str, total_tokens: f64) -> f64 {
     (total_tokens / 1000.0) * per_1k
 }
 
-fn headers_to_map(headers: &HeaderMap) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
+fn headers_to_map(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
     for (k, v) in headers {
         if let Ok(value) = v.to_str() {
-            map.insert(k.as_str().to_string(), json!(value));
+            map.insert(k.as_str().to_string(), value.to_string());
         }
     }
-    serde_json::Value::Object(map)
+    map
+}
+
+fn build_runtime(config: &AppConfig) -> Result<CapabilityRuntime> {
+    let wasm_plugins = plugins::PluginManager::from_config(&config.plugins)?;
+    let mut capabilities: Vec<Box<dyn kernel::capability::Capability>> = vec![
+        Box::new(IdentityCapability::new(config.auth.clone())),
+        Box::new(PolicyCapability::new(config.policies.clone())),
+        Box::new(BudgetCapability::new(8_192)),
+        Box::new(GuardrailCapability::new(Vec::new())),
+        Box::new(RoutingCapability),
+        Box::new(ToolMcpCapability),
+        Box::new(ProviderRoutingCapability),
+        Box::new(WasmCapability::new(wasm_plugins)),
+    ];
+
+    if !config.capabilities.pipeline.is_empty() {
+        capabilities.retain(|cap| config.capabilities.pipeline.iter().any(|id| id == cap.id()));
+    }
+    let runtime = CapabilityRuntime::new(capabilities, &config.capabilities.pipeline);
+    runtime.ensure_contains("identity")?;
+    runtime.ensure_contains("provider_router")?;
+    Ok(runtime)
 }
 
 pub async fn run(config_path: &str) -> Result<()> {
@@ -331,7 +334,7 @@ pub async fn run(config_path: &str) -> Result<()> {
         .try_init();
 
     let providers = Arc::new(ProviderRegistry::new(&config)?);
-    let plugins = Arc::new(PluginManager::from_config(&config.plugins)?);
+    let runtime = Arc::new(build_runtime(&config)?);
     let limiter = Arc::new(RateLimiter::new(
         config.limits.global_per_minute,
         config.limits.per_key_per_minute,
@@ -341,7 +344,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     let app = build_app(AppState {
         config: config.clone(),
         providers,
-        plugins,
+        runtime,
         limiter,
         metrics,
     });
@@ -365,8 +368,8 @@ mod tests {
 
     use crate::{
         config::{
-            AppConfig, AuthConfig, LimitsConfig, ListenerConfig, ObservabilityConfig,
-            ProviderConfig, ProviderKind,
+            AppConfig, AuthConfig, CapabilityConfig, LimitsConfig, ListenerConfig,
+            ObservabilityConfig, ProviderConfig, ProviderKind,
         },
         providers::ProviderRegistry,
     };
@@ -397,12 +400,14 @@ mod tests {
             providers,
             model_aliases: HashMap::new(),
             plugins: vec![],
+            capabilities: CapabilityConfig::default(),
+            policies: vec![],
             observability: ObservabilityConfig::default(),
         });
 
         AppState {
             providers: Arc::new(ProviderRegistry::new(&config).expect("registry")),
-            plugins: Arc::new(PluginManager::from_config(&[]).expect("plugins")),
+            runtime: Arc::new(build_runtime(&config).expect("runtime")),
             limiter: Arc::new(RateLimiter::new(100, 100)),
             metrics: Arc::new(Metrics::new().expect("metrics")),
             config,

@@ -331,7 +331,8 @@ impl ProviderClient {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        AppConfig, AuthConfig, LimitsConfig, ListenerConfig, ModelRoute, ObservabilityConfig,
+        AppConfig, AuthConfig, CapabilityConfig, LimitsConfig, ListenerConfig, ModelRoute,
+        ObservabilityConfig,
     };
 
     use super::*;
@@ -368,6 +369,8 @@ mod tests {
             providers,
             model_aliases: aliases,
             plugins: vec![],
+            capabilities: CapabilityConfig::default(),
+            policies: vec![],
             observability: ObservabilityConfig::default(),
         };
 
