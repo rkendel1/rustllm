@@ -1,8 +1,10 @@
 use crate::kernel::{
-    capability::{Capability, CapabilityFuture, CapabilityResult},
+    capability::{Capability, CapabilityFuture, CapabilityResult, PlanningFuture},
     context::{CapabilityState, RequestContext},
     manifest::CapabilityManifest,
+    planning::PlanningContext,
 };
+use crate::runtime::planner_result::{BudgetEstimate, CapabilityPlan};
 
 #[derive(Clone)]
 pub struct BudgetCapability {
@@ -71,6 +73,26 @@ impl Capability for BudgetCapability {
                 });
             }
             Ok(CapabilityResult::Continue)
+        })
+    }
+
+    fn plan<'a>(&'a self, ctx: &'a PlanningContext) -> PlanningFuture<'a> {
+        Box::pin(async move {
+            let estimated_tokens = ctx.request.messages.len() as u64 * 256;
+            let estimated_cost_usd = (estimated_tokens as f64 / 1000.0) * 0.001;
+            let remaining_budget = self
+                .default_max_input_tokens
+                .saturating_sub(estimated_tokens);
+            Ok(CapabilityPlan {
+                capability_id: self.id().to_string(),
+                budget: Some(BudgetEstimate {
+                    estimated_tokens,
+                    estimated_cost_usd,
+                    remaining_budget,
+                }),
+                confidence: Some(0.75),
+                ..Default::default()
+            })
         })
     }
 }

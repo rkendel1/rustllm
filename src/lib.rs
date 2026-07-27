@@ -16,11 +16,12 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -33,6 +34,7 @@ use crate::{
     },
     config::AppConfig,
     kernel::{
+        approval::ApprovalEngine,
         capability::CapabilityResult,
         context::{Identity, Metadata, RequestContext, ResponseContext},
         runtime::CapabilityRuntime,
@@ -58,6 +60,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/healthz", get(health))
         .route("/health", get(health))
         .route("/debug/plan", get(debug_plan))
+        .route("/debug/intent", get(debug_intent))
         .route("/metrics", get(metrics_handler))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
@@ -86,8 +89,23 @@ async fn debug_plan(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.runtime.diagnostics().clone())
 }
 
+async fn debug_intent(State(state): State<AppState>) -> impl IntoResponse {
+    let body = json!({
+        "intent": state.runtime.latest_intent(),
+        "decision_log": state.runtime.latest_decisions(),
+    });
+    Json(body)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatCompletionsQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
+    Query(query): Query<ChatCompletionsQuery>,
     headers: HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Response {
@@ -111,6 +129,59 @@ async fn chat_completions(
         policy: Default::default(),
         headers: headers_to_map(&headers),
     };
+
+    let intent = match state.runtime.plan_execution_intent(&request_ctx).await {
+        Ok(intent) => intent,
+        Err(err) => {
+            state.metrics.plugin_errors_total.inc();
+            error!(error = %err, "planning failure");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "planning failure",
+                "planning_error",
+            );
+        }
+    };
+
+    if query.dry_run {
+        state
+            .metrics
+            .requests_total
+            .with_label_values(&["200"])
+            .inc();
+        return Json(json!({
+            "provider": intent.selected_provider(),
+            "model": intent.model(),
+            "estimated_cost": intent.estimated_cost(),
+            "estimated_tokens": intent.estimated_tokens(),
+            "policy": if intent.policies().is_empty() { "allowed" } else { "matched" },
+            "budget": "remaining",
+            "tools": intent.required_tools(),
+            "execution_graph": intent.execution_graph(),
+            "metadata": intent.metadata(),
+        }))
+        .into_response();
+    }
+
+    if let Some(approval) = ApprovalEngine::required(&intent) {
+        state
+            .metrics
+            .requests_total
+            .with_label_values(&["202"])
+            .inc();
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status":"approval_required",
+                "reason": approval.reason,
+                "intent": intent
+            })),
+        )
+            .into_response();
+    }
+
+    request = intent.request().clone();
+    request_ctx.model = request.clone();
 
     match state.runtime.on_request(&mut request_ctx).await {
         Ok((CapabilityResult::Continue | CapabilityResult::Modify, _events)) => {
@@ -387,7 +458,7 @@ mod tests {
     use crate::{
         config::{
             AppConfig, AuthConfig, CapabilityConfig, LimitsConfig, ListenerConfig,
-            ObservabilityConfig, ProviderConfig, ProviderKind,
+            ObservabilityConfig, PolicyRule, ProviderConfig, ProviderKind,
         },
         providers::ProviderRegistry,
     };
@@ -432,6 +503,22 @@ mod tests {
         }
     }
 
+    fn approval_state() -> AppState {
+        let mut state = test_state();
+        let config = Arc::new(AppConfig {
+            policies: vec![PolicyRule {
+                name: "approval-policy".to_string(),
+                when: HashMap::from([("user.plan".to_string(), "free".to_string())]),
+                deny: Default::default(),
+                require_approval: true,
+            }],
+            ..(*state.config).clone()
+        });
+        state.runtime = Arc::new(build_runtime(&config).expect("runtime"));
+        state.config = config;
+        state
+    }
+
     #[tokio::test]
     async fn health_endpoint_works() {
         let app = build_app(test_state());
@@ -463,6 +550,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debug_intent_endpoint_works() {
+        let app = build_app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/intent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn rejects_unauthorized_chat() {
         let app = build_app(test_state());
         let body = serde_json::to_vec(&json!({
@@ -483,5 +585,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_execution_intent() {
+        let app = build_app(test_state());
+        let body = serde_json::to_vec(&json!({
+            "model": "local:foo",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        }))
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions?dry_run=true")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn returns_approval_required_before_execution() {
+        let app = build_app(approval_state());
+        let body = serde_json::to_vec(&json!({
+            "model": "local:foo",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        }))
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "******")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 }

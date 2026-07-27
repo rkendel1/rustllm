@@ -2,10 +2,12 @@ use crate::{
     auth::{extract_bearer, is_authorized},
     config::AuthConfig,
     kernel::{
-        capability::{Capability, CapabilityFuture, CapabilityResult},
+        capability::{Capability, CapabilityFuture, CapabilityResult, PlanningFuture},
         context::{CapabilityState, RequestContext},
         manifest::CapabilityManifest,
+        planning::PlanningContext,
     },
+    runtime::planner_result::{CapabilityPlan, IdentityDecision},
 };
 
 #[derive(Clone)]
@@ -73,6 +75,31 @@ impl Capability for IdentityCapability {
                 .facts
                 .publish("identity.plan", ctx.identity.plan.clone());
             Ok(CapabilityResult::Continue)
+        })
+    }
+
+    fn plan<'a>(&'a self, ctx: &'a PlanningContext) -> PlanningFuture<'a> {
+        Box::pin(async move {
+            let mut headers = axum::http::HeaderMap::new();
+            for (k, v) in &ctx.headers {
+                if let Ok(name) = axum::http::header::HeaderName::from_bytes(k.as_bytes())
+                    && let Ok(value) = axum::http::HeaderValue::from_str(v)
+                {
+                    headers.insert(name, value);
+                }
+            }
+            let api_key = extract_bearer(&headers);
+            let authenticated = is_authorized(&headers, &self.auth);
+            Ok(CapabilityPlan {
+                capability_id: self.id().to_string(),
+                identity: Some(IdentityDecision {
+                    authenticated,
+                    api_key_present: api_key.is_some(),
+                    plan: ctx.identity.plan.clone(),
+                }),
+                confidence: Some(1.0),
+                ..Default::default()
+            })
         })
     }
 }

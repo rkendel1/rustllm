@@ -1,8 +1,10 @@
 use crate::kernel::{
-    capability::{Capability, CapabilityFuture, CapabilityResult},
+    capability::{Capability, CapabilityFuture, CapabilityResult, PlanningFuture},
     context::{CapabilityState, RequestContext},
     manifest::CapabilityManifest,
+    planning::PlanningContext,
 };
+use crate::runtime::planner_result::{CapabilityPlan, IntentClassification};
 
 #[derive(Clone, Default)]
 pub struct RoutingCapability;
@@ -57,6 +59,22 @@ impl Capability for RoutingCapability {
             }
             state.facts.publish("semantic.confidence", confidence);
             Ok(CapabilityResult::Modify)
+        })
+    }
+
+    fn plan<'a>(&'a self, ctx: &'a PlanningContext) -> PlanningFuture<'a> {
+        Box::pin(async move {
+            let (intent, confidence) = if ctx.request.tools.is_some() {
+                ("tools".to_string(), 0.94)
+            } else {
+                ("chat".to_string(), 0.82)
+            };
+            Ok(CapabilityPlan {
+                capability_id: self.id().to_string(),
+                intent: Some(IntentClassification { intent, confidence }),
+                confidence: Some(confidence),
+                ..Default::default()
+            })
         })
     }
 }
