@@ -93,9 +93,14 @@ async fn debug_plan(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn debug_intent(State(state): State<AppState>) -> impl IntoResponse {
+    let intent = state.runtime.latest_intent();
+    let provider_selection = intent
+        .as_ref()
+        .and_then(|v| v.metadata().get("provider_explainability").cloned());
     let body = json!({
-        "intent": state.runtime.latest_intent(),
+        "intent": intent,
         "decision_log": state.runtime.latest_decisions(),
+        "provider_selection": provider_selection,
     });
     Json(body)
 }
