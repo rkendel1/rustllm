@@ -67,3 +67,6 @@ policies:
 
 observability:
   log_level: "info"
+
+routing:
+  strategy: adaptive

@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub policies: Vec<PolicyRule>,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +177,24 @@ pub struct PolicyDeny {
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub log_level: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    #[serde(default = "default_routing_strategy")]
+    pub strategy: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: default_routing_strategy(),
+        }
+    }
+}
+
+fn default_routing_strategy() -> String {
+    "adaptive".to_string()
 }
 
 impl AppConfig {

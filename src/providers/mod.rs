@@ -1,3 +1,5 @@
+pub mod health;
+
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
@@ -38,8 +40,20 @@ struct RouteTarget {
 }
 
 pub enum ProviderResult {
-    Json(serde_json::Value, String),
-    Stream(ByteStream, String),
+    Json {
+        body: serde_json::Value,
+        provider_model: String,
+        provider_id: String,
+        retries: u32,
+        http_status: Option<u16>,
+    },
+    Stream {
+        stream: ByteStream,
+        provider_model: String,
+        provider_id: String,
+        retries: u32,
+        http_status: Option<u16>,
+    },
 }
 
 impl ProviderRegistry {
@@ -111,7 +125,35 @@ impl ProviderRegistry {
                 };
 
                 match result {
-                    Ok(ok) => return Ok(ok),
+                    Ok(ok) => {
+                        let retries = attempt as u32;
+                        return Ok(match ok {
+                            ProviderResult::Json {
+                                body,
+                                provider_model,
+                                http_status,
+                                ..
+                            } => ProviderResult::Json {
+                                body,
+                                provider_model,
+                                provider_id: route.provider_id.clone(),
+                                retries,
+                                http_status,
+                            },
+                            ProviderResult::Stream {
+                                stream,
+                                provider_model,
+                                http_status,
+                                ..
+                            } => ProviderResult::Stream {
+                                stream,
+                                provider_model,
+                                provider_id: route.provider_id.clone(),
+                                retries,
+                                http_status,
+                            },
+                        });
+                    }
                     Err(err) => {
                         last_error = Some(err.context(format!(
                             "provider '{}' attempt {} failed",
@@ -239,7 +281,13 @@ impl ProviderClient {
         if !status.is_success() {
             return Err(anyhow!("provider returned status {}: {}", status, body));
         }
-        Ok(ProviderResult::Json(body, req.model.clone()))
+        Ok(ProviderResult::Json {
+            body,
+            provider_model: req.model.clone(),
+            provider_id: String::new(),
+            retries: 0,
+            http_status: Some(status.as_u16()),
+        })
     }
 
     async fn stream_openai(
@@ -265,7 +313,13 @@ impl ProviderClient {
         let stream = response
             .bytes_stream()
             .map(|item| item.map_err(|e| anyhow!("stream error: {}", e)));
-        Ok(ProviderResult::Stream(Box::pin(stream), req.model.clone()))
+        Ok(ProviderResult::Stream {
+            stream: Box::pin(stream),
+            provider_model: req.model.clone(),
+            provider_id: String::new(),
+            retries: 0,
+            http_status: Some(status.as_u16()),
+        })
     }
 
     async fn chat_anthropic(&self, req: &ChatCompletionRequest) -> Result<ProviderResult> {
@@ -293,7 +347,13 @@ impl ProviderClient {
         if !status.is_success() {
             return Err(anyhow!("provider returned status {}: {}", status, body));
         }
-        Ok(ProviderResult::Json(body, req.model.clone()))
+        Ok(ProviderResult::Json {
+            body,
+            provider_model: req.model.clone(),
+            provider_id: String::new(),
+            retries: 0,
+            http_status: Some(status.as_u16()),
+        })
     }
 
     async fn stream_anthropic(&self, req: &ChatCompletionRequest) -> Result<ProviderResult> {
@@ -324,7 +384,13 @@ impl ProviderClient {
         let stream = response
             .bytes_stream()
             .map(|item| item.map_err(|e| anyhow!("stream error: {}", e)));
-        Ok(ProviderResult::Stream(Box::pin(stream), req.model.clone()))
+        Ok(ProviderResult::Stream {
+            stream: Box::pin(stream),
+            provider_model: req.model.clone(),
+            provider_id: String::new(),
+            retries: 0,
+            http_status: Some(status.as_u16()),
+        })
     }
 }
 
@@ -332,7 +398,7 @@ impl ProviderClient {
 mod tests {
     use crate::config::{
         AppConfig, AuthConfig, CapabilityConfig, LimitsConfig, ListenerConfig, ModelRoute,
-        ObservabilityConfig,
+        ObservabilityConfig, RoutingConfig,
     };
 
     use super::*;
@@ -372,6 +438,7 @@ mod tests {
             capabilities: CapabilityConfig::default(),
             policies: vec![],
             observability: ObservabilityConfig::default(),
+            routing: RoutingConfig::default(),
         };
 
         let reg = ProviderRegistry::new(&cfg).expect("valid registry");
