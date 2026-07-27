@@ -6,7 +6,11 @@ use crate::runtime::{
     planner_result::{ApprovalRequest, PlannerResult},
 };
 
-use super::planning::PlanningContext;
+use super::{
+    knowledge::RuntimeKnowledgeSnapshot,
+    planning::PlanningContext,
+    scoring::{ProviderScoreBreakdown, RoutingStrategy, score_provider},
+};
 
 pub struct IntentOptimizer;
 
@@ -15,20 +19,25 @@ impl IntentOptimizer {
         planning_ctx: &PlanningContext,
         graph: &ExecutionPlan,
         planner_result: PlannerResult,
+        knowledge: &RuntimeKnowledgeSnapshot,
     ) -> ExecutionIntent {
-        let mut selected_provider = planning_ctx
-            .request
+        let mut request = planning_ctx.request.clone();
+        let mut selected_provider = request
             .model
             .split_once(':')
             .map(|(provider, _)| provider.to_string());
-        let mut selected_model = planning_ctx.request.model.clone();
-        let mut estimated_tokens = planning_ctx.request.messages.len() as u64 * 256;
+        let mut selected_model = request.model.clone();
+        let mut estimated_tokens = request.messages.len() as u64 * 256;
         let mut estimated_cost = estimate_cost(&selected_model, estimated_tokens as f64);
         let mut required_tools = BTreeSet::new();
         let mut approvals = Vec::<ApprovalRequest>::new();
         let mut policies = Vec::<String>::new();
         let mut metadata = HashMap::<String, serde_json::Value>::new();
         let mut seen_intent: Option<String> = None;
+        let mut remaining_budget: Option<u64> = None;
+        let mut candidate_providers = Vec::<String>::new();
+        let mut candidate_models = HashMap::<String, String>::new();
+        let mut routing_strategy = RoutingStrategy::Adaptive;
 
         for plan in &planner_result.plans {
             if let Some(policy) = &plan.policy {
@@ -45,6 +54,7 @@ impl IntentOptimizer {
             if let Some(budget) = &plan.budget {
                 estimated_tokens = budget.estimated_tokens;
                 estimated_cost = budget.estimated_cost_usd;
+                remaining_budget = Some(budget.remaining_budget);
                 metadata.insert(
                     "remaining_budget".to_string(),
                     serde_json::json!(budget.remaining_budget),
@@ -69,11 +79,15 @@ impl IntentOptimizer {
                 );
             }
             if let Some(providers) = &plan.providers {
-                if let Some(first) = providers.providers.first() {
-                    selected_provider = Some(first.clone());
+                if !providers.providers.is_empty() {
+                    candidate_providers = providers.providers.clone();
                 }
+                candidate_models.extend(providers.provider_models.clone());
                 if let Some(model) = &providers.selected_model {
                     selected_model = model.clone();
+                }
+                if let Some(strategy) = &providers.strategy {
+                    routing_strategy = RoutingStrategy::from_str(strategy);
                 }
             }
             if let Some(tools) = &plan.required_tools {
@@ -84,8 +98,53 @@ impl IntentOptimizer {
             metadata.extend(plan.metadata.clone());
         }
 
+        let provider_scores = Self::score_candidates(
+            &candidate_providers,
+            knowledge,
+            seen_intent.as_deref(),
+            remaining_budget,
+        );
+        if let Some(provider) = Self::select_provider(
+            &candidate_providers,
+            &routing_strategy,
+            &provider_scores,
+            knowledge,
+        ) {
+            selected_provider = Some(provider.clone());
+            if let Some(model) = candidate_models.get(&provider) {
+                selected_model = format!("{provider}:{model}");
+            }
+            if let Some(score) = provider_scores.get(&provider) {
+                metadata.insert(
+                    "provider_explainability".to_string(),
+                    serde_json::json!({
+                        "selected_provider": provider,
+                        "strategy": routing_strategy.as_str(),
+                        "latency_score": score.latency,
+                        "success_score": score.success,
+                        "budget_score": score.cost,
+                        "semantic_score": score.intent_fit,
+                        "configured_preference": score.policy,
+                        "final_score": score.final_score
+                    }),
+                );
+            }
+        }
+        if !provider_scores.is_empty() {
+            metadata.insert(
+                "provider_scores".to_string(),
+                serde_json::to_value(&provider_scores).unwrap_or_else(|_| serde_json::json!({})),
+            );
+        }
+        metadata.insert(
+            "routing_strategy".to_string(),
+            serde_json::json!(routing_strategy.as_str()),
+        );
+
+        request.model = selected_model.clone();
+
         ExecutionIntent::new(
-            planning_ctx.request.clone(),
+            request,
             selected_provider,
             selected_model,
             estimated_cost,
@@ -97,6 +156,100 @@ impl IntentOptimizer {
             metadata,
             planner_result.decision_log,
         )
+    }
+
+    fn score_candidates(
+        candidates: &[String],
+        knowledge: &RuntimeKnowledgeSnapshot,
+        intent: Option<&str>,
+        remaining_budget: Option<u64>,
+    ) -> HashMap<String, ProviderScoreBreakdown> {
+        let mut scores = HashMap::new();
+        for (idx, provider) in candidates.iter().enumerate() {
+            let score = score_provider(
+                knowledge.providers.get(provider),
+                idx,
+                intent,
+                remaining_budget,
+            );
+            scores.insert(provider.clone(), score);
+        }
+        scores
+    }
+
+    fn select_provider(
+        candidates: &[String],
+        strategy: &RoutingStrategy,
+        scores: &HashMap<String, ProviderScoreBreakdown>,
+        knowledge: &RuntimeKnowledgeSnapshot,
+    ) -> Option<String> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        match strategy {
+            RoutingStrategy::FirstAvailable => candidates
+                .iter()
+                .find(|p| {
+                    knowledge
+                        .providers
+                        .get(*p)
+                        .map(|h| h.availability > 0.0)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .or_else(|| candidates.first().cloned()),
+            RoutingStrategy::Cheapest => candidates
+                .iter()
+                .min_by(|a, b| {
+                    let a_cost = knowledge
+                        .providers
+                        .get(*a)
+                        .map(|h| h.average_cost)
+                        .unwrap_or(0.0);
+                    let b_cost = knowledge
+                        .providers
+                        .get(*b)
+                        .map(|h| h.average_cost)
+                        .unwrap_or(0.0);
+                    a_cost.total_cmp(&b_cost)
+                })
+                .cloned(),
+            RoutingStrategy::Fastest | RoutingStrategy::LowestLatency => candidates
+                .iter()
+                .min_by_key(|provider| {
+                    knowledge
+                        .providers
+                        .get(*provider)
+                        .map(|h| h.latency_p50)
+                        .unwrap_or(u64::MAX)
+                })
+                .cloned(),
+            RoutingStrategy::HighestSuccess => candidates
+                .iter()
+                .max_by(|a, b| {
+                    let a_score = knowledge
+                        .providers
+                        .get(*a)
+                        .map(|h| h.success_rate)
+                        .unwrap_or(0.0);
+                    let b_score = knowledge
+                        .providers
+                        .get(*b)
+                        .map(|h| h.success_rate)
+                        .unwrap_or(0.0);
+                    a_score.total_cmp(&b_score)
+                })
+                .cloned(),
+            RoutingStrategy::Balanced | RoutingStrategy::Adaptive => candidates
+                .iter()
+                .max_by(|a, b| {
+                    let a_score = scores.get(*a).map(|v| v.final_score).unwrap_or(0.0);
+                    let b_score = scores.get(*b).map(|v| v.final_score).unwrap_or(0.0);
+                    a_score.total_cmp(&b_score)
+                })
+                .cloned(),
+        }
     }
 }
 
@@ -117,6 +270,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
+        kernel::knowledge::RuntimeKnowledgeSnapshot,
         kernel::planning::PlanningContext,
         models::{ChatCompletionRequest, ChatMessage},
         runtime::{
@@ -173,6 +327,8 @@ mod tests {
                     providers: Some(ProviderSelectionCandidates {
                         providers: vec!["anthropic".to_string()],
                         selected_model: Some("anthropic:sonnet".to_string()),
+                        strategy: None,
+                        provider_models: HashMap::new(),
                     }),
                     intent: Some(IntentClassification {
                         intent: "chat".to_string(),
@@ -184,7 +340,12 @@ mod tests {
             decision_log: vec![],
         };
 
-        let intent = IntentOptimizer::optimize(&planning_ctx, &graph, result);
+        let intent = IntentOptimizer::optimize(
+            &planning_ctx,
+            &graph,
+            result,
+            &RuntimeKnowledgeSnapshot::default(),
+        );
         assert_eq!(intent.selected_provider(), Some("anthropic"));
         assert_eq!(intent.model(), "anthropic:sonnet");
         assert_eq!(intent.estimated_tokens(), 2048);
@@ -231,7 +392,12 @@ mod tests {
             decision_log: vec![],
         };
 
-        let intent = IntentOptimizer::optimize(&planning_ctx, &graph, result);
+        let intent = IntentOptimizer::optimize(
+            &planning_ctx,
+            &graph,
+            result,
+            &RuntimeKnowledgeSnapshot::default(),
+        );
         assert!(intent.metadata().contains_key("conflicting_intents"));
     }
 }

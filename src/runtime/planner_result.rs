@@ -37,6 +37,10 @@ pub struct ProviderSelectionCandidates {
     #[serde(default)]
     pub providers: Vec<String>,
     pub selected_model: Option<String>,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub provider_models: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

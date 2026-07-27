@@ -38,11 +38,13 @@ use crate::{
         capability::CapabilityResult,
         context::{Identity, Metadata, RequestContext, ResponseContext},
         runtime::CapabilityRuntime,
+        scoring::RoutingStrategy,
     },
     metrics::Metrics,
     models::{ChatCompletionRequest, openai_error},
     providers::{ProviderRegistry, ProviderResult},
     rate_limit::RateLimiter,
+    runtime::observation::ExecutionObservation,
     wasm::loader::WasmCapability,
 };
 
@@ -61,6 +63,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/debug/plan", get(debug_plan))
         .route("/debug/intent", get(debug_intent))
+        .route("/debug/knowledge", get(debug_knowledge))
         .route("/metrics", get(metrics_handler))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
@@ -95,6 +98,25 @@ async fn debug_intent(State(state): State<AppState>) -> impl IntoResponse {
         "decision_log": state.runtime.latest_decisions(),
     });
     Json(body)
+}
+
+async fn debug_knowledge(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state.runtime.knowledge_snapshot();
+    let providers = snapshot
+        .providers
+        .iter()
+        .map(|(id, health)| {
+            (
+                id.clone(),
+                json!({
+                    "success_rate": health.success_rate * 100.0,
+                    "latency_p95": health.latency_p95,
+                    "avg_cost": health.average_cost
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    Json(json!({ "providers": providers }))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,9 +242,22 @@ async fn chat_completions(
         return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited", "rate_limit");
     }
 
+    let provider_started = Instant::now();
     let provider_result = match state.providers.execute(&request, &headers).await {
         Ok(result) => result,
         Err(err) => {
+            state.runtime.observe(ExecutionObservation::new(
+                "all".to_string(),
+                request.model.clone(),
+                provider_started.elapsed().as_millis() as u64,
+                request.stream,
+                state.config.limits.retries as u32,
+                false,
+                None,
+                None,
+                Some(err.to_string()),
+                Some(502),
+            ));
             state
                 .metrics
                 .provider_errors_total
@@ -247,7 +282,13 @@ async fn chat_completions(
         .observe_latency("chat_completions", started.elapsed());
 
     match provider_result {
-        ProviderResult::Json(mut body, provider_model) => {
+        ProviderResult::Json {
+            mut body,
+            provider_model,
+            provider_id,
+            retries,
+            http_status,
+        } => {
             let mut response_ctx = ResponseContext {
                 request_id: request_id.clone(),
                 identity: request_ctx.identity.clone(),
@@ -274,6 +315,18 @@ async fn chat_completions(
                     );
                 }
                 Err(err) => {
+                    state.runtime.observe(ExecutionObservation::new(
+                        provider_id.clone(),
+                        provider_model.clone(),
+                        provider_started.elapsed().as_millis() as u64,
+                        false,
+                        retries,
+                        false,
+                        None,
+                        None,
+                        Some(err.to_string()),
+                        Some(500),
+                    ));
                     state.metrics.plugin_errors_total.inc();
                     error!(error = %err, "capability runtime response failure");
                     return error_response(
@@ -300,6 +353,31 @@ async fn chat_completions(
                     .cost_total_usd
                     .with_label_values(&[&provider_model])
                     .inc_by(cost);
+                state.runtime.observe(ExecutionObservation::new(
+                    provider_id,
+                    provider_model.clone(),
+                    provider_started.elapsed().as_millis() as u64,
+                    false,
+                    retries,
+                    true,
+                    Some(tokens as u64),
+                    Some(cost),
+                    None,
+                    http_status,
+                ));
+            } else {
+                state.runtime.observe(ExecutionObservation::new(
+                    provider_id,
+                    provider_model.clone(),
+                    provider_started.elapsed().as_millis() as u64,
+                    false,
+                    retries,
+                    true,
+                    None,
+                    None,
+                    None,
+                    http_status,
+                ));
             }
 
             state
@@ -315,7 +393,25 @@ async fn chat_completions(
             );
             response
         }
-        ProviderResult::Stream(stream, _provider_model) => {
+        ProviderResult::Stream {
+            stream,
+            provider_model,
+            provider_id,
+            retries,
+            http_status,
+        } => {
+            state.runtime.observe(ExecutionObservation::new(
+                provider_id,
+                provider_model,
+                provider_started.elapsed().as_millis() as u64,
+                true,
+                retries,
+                true,
+                None,
+                None,
+                None,
+                http_status,
+            ));
             state
                 .metrics
                 .requests_total
@@ -399,7 +495,10 @@ fn build_runtime(config: &AppConfig) -> Result<CapabilityRuntime> {
         Box::new(GuardrailCapability::new(Vec::new())),
         Box::new(RoutingCapability),
         Box::new(ToolMcpCapability),
-        Box::new(ProviderRoutingCapability),
+        Box::new(ProviderRoutingCapability::new(
+            config.model_aliases.clone(),
+            RoutingStrategy::from_str(&config.routing.strategy),
+        )),
         Box::new(WasmCapability::new(wasm_plugins)),
     ];
     let runtime = CapabilityRuntime::new(capabilities, &config.capabilities.pipeline)?;
@@ -458,7 +557,7 @@ mod tests {
     use crate::{
         config::{
             AppConfig, AuthConfig, CapabilityConfig, LimitsConfig, ListenerConfig,
-            ObservabilityConfig, PolicyRule, ProviderConfig, ProviderKind,
+            ObservabilityConfig, PolicyRule, ProviderConfig, ProviderKind, RoutingConfig,
         },
         providers::ProviderRegistry,
     };
@@ -492,6 +591,7 @@ mod tests {
             capabilities: CapabilityConfig::default(),
             policies: vec![],
             observability: ObservabilityConfig::default(),
+            routing: RoutingConfig::default(),
         });
 
         AppState {
@@ -565,6 +665,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debug_knowledge_endpoint_works() {
+        let app = build_app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/knowledge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn rejects_unauthorized_chat() {
         let app = build_app(test_state());
         let body = serde_json::to_vec(&json!({
@@ -608,6 +723,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            parsed["metadata"]["routing_strategy"].as_str(),
+            Some("adaptive")
+        );
     }
 
     #[tokio::test]

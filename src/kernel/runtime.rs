@@ -1,19 +1,21 @@
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, anyhow};
 
 use crate::runtime::{
-    decision::CapabilityDecisionLog, execution_intent::ExecutionIntent, execution_plan::ExecutionPlan,
+    decision::CapabilityDecisionLog, execution_intent::ExecutionIntent,
+    execution_plan::ExecutionPlan, observation::ExecutionObservation,
 };
 
 use super::{
     approval::ApprovalEngine,
     capability::{Capability, CapabilityResult},
     context::{CapabilityState, RequestContext, ResponseContext},
+    knowledge::{KnowledgeStore, MemoryKnowledgeStore, RuntimeKnowledgeSnapshot},
     lifecycle::LifecycleEvent,
     optimizer::IntentOptimizer,
-    planning::{PlanningContext, PlanningEngine},
     planner::ExecutionPlanner,
+    planning::{PlanningContext, PlanningEngine},
     registry::CapabilityRegistry,
     scheduler::CapabilityScheduler,
 };
@@ -23,10 +25,23 @@ pub struct CapabilityRuntime {
     plan: ExecutionPlan,
     last_intent: RwLock<Option<ExecutionIntent>>,
     last_decisions: RwLock<Vec<CapabilityDecisionLog>>,
+    knowledge: Arc<dyn KnowledgeStore>,
 }
 
 impl CapabilityRuntime {
     pub fn new(capabilities: Vec<Box<dyn Capability>>, pipeline: &[String]) -> Result<Self> {
+        Self::new_with_knowledge(
+            capabilities,
+            pipeline,
+            Arc::new(MemoryKnowledgeStore::default()),
+        )
+    }
+
+    pub fn new_with_knowledge(
+        capabilities: Vec<Box<dyn Capability>>,
+        pipeline: &[String],
+        knowledge: Arc<dyn KnowledgeStore>,
+    ) -> Result<Self> {
         let mut registry = CapabilityRegistry::new();
         registry.register_many(capabilities)?;
 
@@ -44,6 +59,7 @@ impl CapabilityRuntime {
             plan,
             last_intent: RwLock::new(None),
             last_decisions: RwLock::new(Vec::new()),
+            knowledge,
         })
     }
 
@@ -66,8 +82,14 @@ impl CapabilityRuntime {
     pub async fn plan_execution_intent(&self, ctx: &RequestContext) -> Result<ExecutionIntent> {
         let planning_ctx = PlanningContext::from(ctx);
         let planner_result =
-            PlanningEngine::collect(&self.registry, &self.plan.execution_order, &planning_ctx).await?;
-        let intent = IntentOptimizer::optimize(&planning_ctx, &self.plan, planner_result.clone());
+            PlanningEngine::collect(&self.registry, &self.plan.execution_order, &planning_ctx)
+                .await?;
+        let intent = IntentOptimizer::optimize(
+            &planning_ctx,
+            &self.plan,
+            planner_result.clone(),
+            &self.knowledge.load(),
+        );
         if let Ok(mut slot) = self.last_intent.write() {
             *slot = Some(intent.clone());
         }
@@ -86,6 +108,14 @@ impl CapabilityRuntime {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    pub fn observe(&self, observation: ExecutionObservation) {
+        self.knowledge.observe(observation);
+    }
+
+    pub fn knowledge_snapshot(&self) -> RuntimeKnowledgeSnapshot {
+        self.knowledge.load()
     }
 
     pub fn approval_required(&self, intent: &ExecutionIntent) -> bool {
