@@ -1,75 +1,79 @@
 use anyhow::{Result, anyhow};
 
+use crate::runtime::execution_plan::ExecutionPlan;
+
 use super::{
     capability::{Capability, CapabilityResult},
-    context::{RequestContext, ResponseContext},
-    lifecycle::{LifecycleEvent, LifecycleHook},
+    context::{CapabilityState, RequestContext, ResponseContext},
+    lifecycle::LifecycleEvent,
+    planner::ExecutionPlanner,
+    registry::CapabilityRegistry,
+    scheduler::CapabilityScheduler,
 };
 
 pub struct CapabilityRuntime {
-    pipeline: Vec<Box<dyn Capability>>,
+    registry: CapabilityRegistry,
+    plan: ExecutionPlan,
 }
 
 impl CapabilityRuntime {
-    pub fn new(mut capabilities: Vec<Box<dyn Capability>>, pipeline: &[String]) -> Self {
-        if !pipeline.is_empty() {
-            capabilities.sort_by_key(|cap| {
-                pipeline
-                    .iter()
-                    .position(|id| id == cap.id())
-                    .unwrap_or(usize::MAX)
-            });
+    pub fn new(capabilities: Vec<Box<dyn Capability>>, pipeline: &[String]) -> Result<Self> {
+        let mut registry = CapabilityRegistry::new();
+        registry.register_many(capabilities)?;
+
+        let manifests = registry.manifests_for_pipeline(pipeline)?;
+        let plan = ExecutionPlanner::build_plan(manifests)?;
+        if !plan.missing_dependencies.is_empty() {
+            return Err(anyhow!(
+                "missing capability dependencies: {}",
+                plan.missing_dependencies.join(", ")
+            ));
         }
-        Self {
-            pipeline: capabilities,
-        }
+
+        Ok(Self { registry, plan })
     }
 
-    pub fn describe(&self) -> Vec<(&'static str, &'static str)> {
-        self.pipeline
+    pub fn describe(&self) -> Vec<(&str, &str)> {
+        self.plan
+            .execution_order
             .iter()
-            .map(|cap| (cap.id(), cap.version()))
+            .filter_map(|id| {
+                self.registry
+                    .manifest(id)
+                    .map(|manifest| (manifest.id.as_str(), manifest.version.as_str()))
+            })
             .collect()
+    }
+
+    pub fn diagnostics(&self) -> &ExecutionPlan {
+        &self.plan
     }
 
     pub async fn on_request(
         &self,
         ctx: &mut RequestContext,
     ) -> Result<(CapabilityResult, Vec<LifecycleEvent>)> {
-        let mut events = Vec::with_capacity(self.pipeline.len());
-        for capability in &self.pipeline {
-            events.push(LifecycleEvent {
-                capability_id: capability.id().to_string(),
-                hook: LifecycleHook::OnRequest,
-            });
-            match capability.on_request(ctx).await? {
-                CapabilityResult::Continue => {}
-                denied => return Ok((denied, events)),
-            }
-        }
-        Ok((CapabilityResult::Continue, events))
+        let mut state = CapabilityState::from_request(ctx);
+        let result =
+            CapabilityScheduler::execute_request(&self.registry, &self.plan, ctx, &mut state).await;
+        state.apply_to_request(ctx);
+        result
     }
 
     pub async fn on_response(
         &self,
         ctx: &mut ResponseContext,
     ) -> Result<(CapabilityResult, Vec<LifecycleEvent>)> {
-        let mut events = Vec::with_capacity(self.pipeline.len());
-        for capability in self.pipeline.iter().rev() {
-            events.push(LifecycleEvent {
-                capability_id: capability.id().to_string(),
-                hook: LifecycleHook::OnResponse,
-            });
-            match capability.on_response(ctx).await? {
-                CapabilityResult::Continue => {}
-                denied => return Ok((denied, events)),
-            }
-        }
-        Ok((CapabilityResult::Continue, events))
+        let mut state = CapabilityState::from_response(ctx);
+        let result =
+            CapabilityScheduler::execute_response(&self.registry, &self.plan, ctx, &mut state)
+                .await;
+        state.apply_to_response(ctx);
+        result
     }
 
     pub fn ensure_contains(&self, id: &str) -> Result<()> {
-        if self.pipeline.iter().any(|cap| cap.id() == id) {
+        if self.plan.execution_order.iter().any(|cap_id| cap_id == id) {
             return Ok(());
         }
         Err(anyhow!("required capability '{}' not configured", id))
@@ -81,7 +85,8 @@ mod tests {
     use crate::{
         kernel::{
             capability::{Capability, CapabilityFuture, CapabilityResult},
-            context::{Identity, Metadata, RequestContext},
+            context::{CapabilityState, Identity, Metadata, RequestContext},
+            manifest::CapabilityManifest,
         },
         models::{ChatCompletionRequest, ChatMessage},
     };
@@ -100,9 +105,27 @@ mod tests {
             "v1"
         }
 
-        fn on_request<'a>(&'a self, _ctx: &'a mut RequestContext) -> CapabilityFuture<'a> {
+        fn manifest(&self) -> CapabilityManifest {
+            CapabilityManifest {
+                id: self.id().to_string(),
+                version: self.version().to_string(),
+                provides: vec!["deny".to_string()],
+                requires: vec![],
+                before: vec![],
+                after: vec![],
+                tags: vec![],
+                permissions: vec![],
+                cost: 1,
+            }
+        }
+
+        fn on_request<'a>(
+            &'a self,
+            _ctx: &'a mut RequestContext,
+            _state: &'a mut CapabilityState,
+        ) -> CapabilityFuture<'a> {
             Box::pin(async {
-                Ok(CapabilityResult::Deny {
+                Ok(CapabilityResult::Fail {
                     message: "blocked".to_string(),
                     kind: "deny".to_string(),
                     status_code: 403,
@@ -113,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn stops_pipeline_on_deny() {
-        let runtime = CapabilityRuntime::new(vec![Box::new(DenyCapability)], &[]);
+        let runtime = CapabilityRuntime::new(vec![Box::new(DenyCapability)], &[]).expect("runtime");
         let mut ctx = RequestContext {
             request_id: "r1".to_string(),
             identity: Identity::default(),
@@ -134,7 +157,7 @@ mod tests {
         };
 
         let (result, events) = runtime.on_request(&mut ctx).await.expect("runtime");
-        assert!(matches!(result, CapabilityResult::Deny { .. }));
+        assert!(matches!(result, CapabilityResult::Fail { .. }));
         assert_eq!(events.len(), 1);
     }
 }

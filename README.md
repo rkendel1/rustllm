@@ -15,7 +15,7 @@ A high-performance, single-binary AI gateway kernel with a capability runtime.
 - Prometheus metrics (`/metrics`)
 - Request ID propagation (`x-request-id`)
 - Token + estimated cost counters
-- Capability runtime pipeline (identity, policy, routing, budget, guardrails, tools, providers, wasm)
+- Capability graph runtime with dependency-aware execution planning
 - Wasm capabilities via the same runtime contract as native capabilities
 
 ## Run
@@ -43,11 +43,13 @@ Input and output payloads are JSON. See `plugins/keyword_guardrail` for a workin
 
 ## Capability runtime
 
-Requests and responses flow through the configurable capability pipeline:
+Requests and responses flow through a dependency-aware capability graph:
 
-`identity -> policy -> budget_guard -> pii_filter -> semantic_router -> tool_mcp -> provider_router -> wasm`
+`identity -> policy -> semantic_router -> (budget_guard, pii_filter, tool_mcp) -> provider_router -> wasm`
 
-Each capability implements a shared contract (`on_request`, `on_response`) and receives a standard runtime context containing identity, metadata, budget, and policy state.
+Each capability implements a shared contract (`on_request`, `on_response`), declares a manifest, and receives a runtime context plus capability state with shared runtime facts.
+
+`GET /debug/plan` returns planner diagnostics including execution order, missing dependencies, and parallel groups.
 
 ## Build example plugin
 

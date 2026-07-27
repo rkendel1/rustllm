@@ -1,4 +1,9 @@
 pub mod capability;
 pub mod context;
+pub mod facts;
 pub mod lifecycle;
+pub mod manifest;
+pub mod planner;
+pub mod registry;
 pub mod runtime;
+pub mod scheduler;

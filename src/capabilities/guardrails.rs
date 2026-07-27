@@ -1,6 +1,7 @@
 use crate::kernel::{
     capability::{Capability, CapabilityFuture, CapabilityResult},
-    context::RequestContext,
+    context::{CapabilityState, RequestContext},
+    manifest::CapabilityManifest,
 };
 
 #[derive(Clone)]
@@ -23,7 +24,25 @@ impl Capability for GuardrailCapability {
         "v1"
     }
 
-    fn on_request<'a>(&'a self, ctx: &'a mut RequestContext) -> CapabilityFuture<'a> {
+    fn manifest(&self) -> CapabilityManifest {
+        CapabilityManifest {
+            id: self.id().to_string(),
+            version: self.version().to_string(),
+            provides: vec!["guardrails".to_string()],
+            requires: vec!["semantic.intent".to_string()],
+            before: vec![],
+            after: vec![],
+            tags: vec!["guardrails".to_string()],
+            permissions: vec!["guardrails.scan".to_string()],
+            cost: 1,
+        }
+    }
+
+    fn on_request<'a>(
+        &'a self,
+        ctx: &'a mut RequestContext,
+        _state: &'a mut CapabilityState,
+    ) -> CapabilityFuture<'a> {
         Box::pin(async move {
             if self.blocked_terms.is_empty() {
                 return Ok(CapabilityResult::Continue);
@@ -35,7 +54,7 @@ impl Capability for GuardrailCapability {
                     .iter()
                     .find(|term| raw.contains(&term.to_lowercase()))
                 {
-                    return Ok(CapabilityResult::Deny {
+                    return Ok(CapabilityResult::Stop {
                         message: format!("request contains blocked term '{}'", term),
                         kind: "guardrail_reject".to_string(),
                         status_code: 403,
