@@ -7,6 +7,7 @@ pub mod models;
 pub mod plugins;
 pub mod providers;
 pub mod rate_limit;
+pub mod runtime;
 pub mod wasm;
 
 use std::{sync::Arc, time::Instant};
@@ -56,6 +57,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/health", get(health))
+        .route("/debug/plan", get(debug_plan))
         .route("/metrics", get(metrics_handler))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
@@ -78,6 +80,10 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
             "server_error",
         ),
     }
+}
+
+async fn debug_plan(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.runtime.diagnostics().clone())
 }
 
 async fn chat_completions(
@@ -107,17 +113,11 @@ async fn chat_completions(
     };
 
     match state.runtime.on_request(&mut request_ctx).await {
-        Ok((CapabilityResult::Continue, _events)) => {
+        Ok((CapabilityResult::Continue | CapabilityResult::Modify, _events)) => {
             request = request_ctx.model.clone();
         }
-        Ok((
-            CapabilityResult::Deny {
-                message,
-                kind,
-                status_code,
-            },
-            _events,
-        )) => {
+        Ok((result, _events)) => {
+            let (status_code, message, kind) = capability_failure_details(result);
             state
                 .metrics
                 .requests_total
@@ -186,17 +186,11 @@ async fn chat_completions(
                 body: body.clone(),
             };
             match state.runtime.on_response(&mut response_ctx).await {
-                Ok((CapabilityResult::Continue, _events)) => {
+                Ok((CapabilityResult::Continue | CapabilityResult::Modify, _events)) => {
                     body = response_ctx.body;
                 }
-                Ok((
-                    CapabilityResult::Deny {
-                        message,
-                        kind,
-                        status_code,
-                    },
-                    _events,
-                )) => {
+                Ok((result, _events)) => {
+                    let (status_code, message, kind) = capability_failure_details(result);
                     state
                         .metrics
                         .requests_total
@@ -275,6 +269,34 @@ fn error_response(status: StatusCode, message: &str, kind: &str) -> Response {
     (status, Json(openai_error(message, kind))).into_response()
 }
 
+fn capability_failure_details(result: CapabilityResult) -> (u16, String, String) {
+    match result {
+        CapabilityResult::Stop {
+            message,
+            kind,
+            status_code,
+        }
+        | CapabilityResult::RequireApproval {
+            message,
+            kind,
+            status_code,
+        }
+        | CapabilityResult::Fail {
+            message,
+            kind,
+            status_code,
+        } => (status_code, message, kind),
+        CapabilityResult::Retry { reason } => (503, reason, "capability_retry".to_string()),
+        CapabilityResult::Suspend { reason } => (503, reason, "capability_suspend".to_string()),
+        CapabilityResult::Redirect { target } => (307, target, "capability_redirect".to_string()),
+        CapabilityResult::Continue | CapabilityResult::Modify => (
+            500,
+            "unexpected capability state".to_string(),
+            "capability_error".to_string(),
+        ),
+    }
+}
+
 fn estimate_cost(model: &str, total_tokens: f64) -> f64 {
     let per_1k = if model.contains("sonnet") {
         0.003
@@ -299,7 +321,7 @@ fn headers_to_map(headers: &HeaderMap) -> std::collections::HashMap<String, Stri
 
 fn build_runtime(config: &AppConfig) -> Result<CapabilityRuntime> {
     let wasm_plugins = plugins::PluginManager::from_config(&config.plugins)?;
-    let mut capabilities: Vec<Box<dyn kernel::capability::Capability>> = vec![
+    let capabilities: Vec<Box<dyn kernel::capability::Capability>> = vec![
         Box::new(IdentityCapability::new(config.auth.clone())),
         Box::new(PolicyCapability::new(config.policies.clone())),
         Box::new(BudgetCapability::new(8_192)),
@@ -309,11 +331,7 @@ fn build_runtime(config: &AppConfig) -> Result<CapabilityRuntime> {
         Box::new(ProviderRoutingCapability),
         Box::new(WasmCapability::new(wasm_plugins)),
     ];
-
-    if !config.capabilities.pipeline.is_empty() {
-        capabilities.retain(|cap| config.capabilities.pipeline.iter().any(|id| id == cap.id()));
-    }
-    let runtime = CapabilityRuntime::new(capabilities, &config.capabilities.pipeline);
+    let runtime = CapabilityRuntime::new(capabilities, &config.capabilities.pipeline)?;
     runtime.ensure_contains("identity")?;
     runtime.ensure_contains("provider_router")?;
     Ok(runtime)
@@ -421,6 +439,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn debug_plan_endpoint_works() {
+        let app = build_app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/plan")
                     .body(Body::empty())
                     .unwrap(),
             )

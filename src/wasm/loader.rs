@@ -8,7 +8,8 @@ use crate::{
     config::PluginConfig,
     kernel::{
         capability::{Capability, CapabilityFuture, CapabilityResult},
-        context::{RequestContext, ResponseContext},
+        context::{CapabilityState, RequestContext, ResponseContext},
+        manifest::CapabilityManifest,
     },
 };
 
@@ -151,12 +152,30 @@ impl Capability for WasmCapability {
         "v1"
     }
 
-    fn on_request<'a>(&'a self, ctx: &'a mut RequestContext) -> CapabilityFuture<'a> {
+    fn manifest(&self) -> CapabilityManifest {
+        CapabilityManifest {
+            id: self.id().to_string(),
+            version: self.version().to_string(),
+            provides: vec!["wasm.hooks".to_string()],
+            requires: vec!["provider.selection".to_string()],
+            before: vec![],
+            after: vec![],
+            tags: vec!["wasm".to_string()],
+            permissions: vec!["plugins.execute".to_string()],
+            cost: 1,
+        }
+    }
+
+    fn on_request<'a>(
+        &'a self,
+        ctx: &'a mut RequestContext,
+        _state: &'a mut CapabilityState,
+    ) -> CapabilityFuture<'a> {
         Box::pin(async move {
             let payload = serde_json::to_value(&ctx.model)?;
             let result = self.plugins.execute(Hook::OnRequest, &payload)?;
             if !result.allow {
-                return Ok(CapabilityResult::Deny {
+                return Ok(CapabilityResult::Fail {
                     message: result
                         .reject_reason
                         .unwrap_or_else(|| "request rejected by wasm capability".to_string()),
@@ -172,11 +191,15 @@ impl Capability for WasmCapability {
         })
     }
 
-    fn on_response<'a>(&'a self, ctx: &'a mut ResponseContext) -> CapabilityFuture<'a> {
+    fn on_response<'a>(
+        &'a self,
+        ctx: &'a mut ResponseContext,
+        _state: &'a mut CapabilityState,
+    ) -> CapabilityFuture<'a> {
         Box::pin(async move {
             let result = self.plugins.execute(Hook::OnResponse, &ctx.body)?;
             if !result.allow {
-                return Ok(CapabilityResult::Deny {
+                return Ok(CapabilityResult::Fail {
                     message: result
                         .reject_reason
                         .unwrap_or_else(|| "response rejected by wasm capability".to_string()),
