@@ -46,5 +46,24 @@ plugins: []
 #         - "password"
 #         - "credit card"
 
+capabilities:
+  pipeline:
+    - identity
+    - policy
+    - budget_guard
+    - pii_filter
+    - semantic_router
+    - tool_mcp
+    - provider_router
+    - wasm
+
+policies:
+  - name: prevent-expensive-models
+    when:
+      user.plan: free
+    deny:
+      models:
+        - claude-opus
+
 observability:
   log_level: "info"
