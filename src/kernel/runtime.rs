@@ -1,11 +1,18 @@
+use std::sync::RwLock;
+
 use anyhow::{Result, anyhow};
 
-use crate::runtime::execution_plan::ExecutionPlan;
+use crate::runtime::{
+    decision::CapabilityDecisionLog, execution_intent::ExecutionIntent, execution_plan::ExecutionPlan,
+};
 
 use super::{
+    approval::ApprovalEngine,
     capability::{Capability, CapabilityResult},
     context::{CapabilityState, RequestContext, ResponseContext},
     lifecycle::LifecycleEvent,
+    optimizer::IntentOptimizer,
+    planning::{PlanningContext, PlanningEngine},
     planner::ExecutionPlanner,
     registry::CapabilityRegistry,
     scheduler::CapabilityScheduler,
@@ -14,6 +21,8 @@ use super::{
 pub struct CapabilityRuntime {
     registry: CapabilityRegistry,
     plan: ExecutionPlan,
+    last_intent: RwLock<Option<ExecutionIntent>>,
+    last_decisions: RwLock<Vec<CapabilityDecisionLog>>,
 }
 
 impl CapabilityRuntime {
@@ -30,7 +39,12 @@ impl CapabilityRuntime {
             ));
         }
 
-        Ok(Self { registry, plan })
+        Ok(Self {
+            registry,
+            plan,
+            last_intent: RwLock::new(None),
+            last_decisions: RwLock::new(Vec::new()),
+        })
     }
 
     pub fn describe(&self) -> Vec<(&str, &str)> {
@@ -47,6 +61,35 @@ impl CapabilityRuntime {
 
     pub fn diagnostics(&self) -> &ExecutionPlan {
         &self.plan
+    }
+
+    pub async fn plan_execution_intent(&self, ctx: &RequestContext) -> Result<ExecutionIntent> {
+        let planning_ctx = PlanningContext::from(ctx);
+        let planner_result =
+            PlanningEngine::collect(&self.registry, &self.plan.execution_order, &planning_ctx).await?;
+        let intent = IntentOptimizer::optimize(&planning_ctx, &self.plan, planner_result.clone());
+        if let Ok(mut slot) = self.last_intent.write() {
+            *slot = Some(intent.clone());
+        }
+        if let Ok(mut log) = self.last_decisions.write() {
+            *log = planner_result.decision_log;
+        }
+        Ok(intent)
+    }
+
+    pub fn latest_intent(&self) -> Option<ExecutionIntent> {
+        self.last_intent.read().ok().and_then(|guard| guard.clone())
+    }
+
+    pub fn latest_decisions(&self) -> Vec<CapabilityDecisionLog> {
+        self.last_decisions
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn approval_required(&self, intent: &ExecutionIntent) -> bool {
+        ApprovalEngine::required(intent).is_some()
     }
 
     pub async fn on_request(

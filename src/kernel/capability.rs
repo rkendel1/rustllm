@@ -2,12 +2,16 @@ use std::{future::Future, pin::Pin};
 
 use anyhow::Result;
 
+use crate::runtime::planner_result::CapabilityPlan;
+
 use super::{
     context::{CapabilityState, RequestContext, ResponseContext},
     manifest::CapabilityManifest,
+    planning::PlanningContext,
 };
 
 pub type CapabilityFuture<'a> = Pin<Box<dyn Future<Output = Result<CapabilityResult>> + Send + 'a>>;
+pub type PlanningFuture<'a> = Pin<Box<dyn Future<Output = Result<CapabilityPlan>> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityResult {
@@ -72,5 +76,9 @@ pub trait Capability: Send + Sync {
         _state: &'a mut CapabilityState,
     ) -> CapabilityFuture<'a> {
         Box::pin(async { Ok(CapabilityResult::Continue) })
+    }
+
+    fn plan<'a>(&'a self, _ctx: &'a PlanningContext) -> PlanningFuture<'a> {
+        Box::pin(async { Ok(CapabilityPlan::default()) })
     }
 }

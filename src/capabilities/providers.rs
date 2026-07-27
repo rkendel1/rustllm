@@ -1,8 +1,10 @@
 use crate::kernel::{
-    capability::{Capability, CapabilityFuture, CapabilityResult},
+    capability::{Capability, CapabilityFuture, CapabilityResult, PlanningFuture},
     context::{CapabilityState, RequestContext},
     manifest::CapabilityManifest,
+    planning::PlanningContext,
 };
+use crate::runtime::planner_result::{CapabilityPlan, ProviderSelectionCandidates};
 
 #[derive(Clone, Default)]
 pub struct ProviderRoutingCapability;
@@ -60,6 +62,24 @@ impl Capability for ProviderRoutingCapability {
                 );
             }
             Ok(CapabilityResult::Continue)
+        })
+    }
+
+    fn plan<'a>(&'a self, ctx: &'a PlanningContext) -> PlanningFuture<'a> {
+        Box::pin(async move {
+            let (provider, model) = match ctx.request.model.split_once(':') {
+                Some((provider, model)) => (provider.to_string(), format!("{provider}:{model}")),
+                None => ("default".to_string(), ctx.request.model.clone()),
+            };
+            Ok(CapabilityPlan {
+                capability_id: self.id().to_string(),
+                providers: Some(ProviderSelectionCandidates {
+                    providers: vec![provider],
+                    selected_model: Some(model),
+                }),
+                confidence: Some(0.8),
+                ..Default::default()
+            })
         })
     }
 }

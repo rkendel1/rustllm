@@ -1,10 +1,12 @@
 use crate::{
     config::PolicyRule,
     kernel::{
-        capability::{Capability, CapabilityFuture, CapabilityResult},
+        capability::{Capability, CapabilityFuture, CapabilityResult, PlanningFuture},
         context::{CapabilityState, RequestContext},
         manifest::CapabilityManifest,
+        planning::PlanningContext,
     },
+    runtime::planner_result::{ApprovalRequest, CapabilityPlan, PolicyDecision},
 };
 
 #[derive(Clone)]
@@ -92,6 +94,54 @@ impl Capability for PolicyCapability {
                 .facts
                 .publish("policy.approval_required", serde_json::json!(false));
             Ok(CapabilityResult::Continue)
+        })
+    }
+
+    fn plan<'a>(&'a self, ctx: &'a PlanningContext) -> PlanningFuture<'a> {
+        Box::pin(async move {
+            let mut matched_rules = Vec::new();
+            let mut allowed = true;
+            let mut approval: Option<ApprovalRequest> = None;
+
+            for rule in &self.rules {
+                let applies_to_free_plan = rule
+                    .when
+                    .get("user.plan")
+                    .map(|v| v == "free")
+                    .unwrap_or(false);
+                if applies_to_free_plan && ctx.identity.plan == "free" {
+                    if rule
+                        .deny
+                        .models
+                        .iter()
+                        .any(|model| model == &ctx.request.model)
+                    {
+                        matched_rules.push(rule.name.clone());
+                        allowed = false;
+                    }
+                    if rule.require_approval {
+                        matched_rules.push(rule.name.clone());
+                        approval = Some(ApprovalRequest {
+                            reason: format!(
+                                "estimated policy risk exceeds threshold (rule '{}')",
+                                rule.name
+                            ),
+                        });
+                    }
+                }
+            }
+
+            Ok(CapabilityPlan {
+                capability_id: self.id().to_string(),
+                policy: Some(PolicyDecision {
+                    allowed,
+                    matched_rules,
+                    approval_required: approval.is_some(),
+                }),
+                approval,
+                confidence: Some(0.9),
+                ..Default::default()
+            })
         })
     }
 }
